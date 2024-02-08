@@ -1,0 +1,646 @@
+---
+title: "Counterfactual Fairness - Recruitment Data"
+author: "Giuliana Orizzonte"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(caret)
+library(rstan)
+library(bayesplot)
+library(gridExtra)
+library(coda)
+
+set.seed(94117)
+```
+
+### Import data set
+
+```{r}
+rec_data <- read.csv("recruitment_data.csv", stringsAsFactors = TRUE)
+```
+
+Check data is imported correctly and variables overview
+
+```{r}
+summary(rec_data)
+# rec_data$decision <- as.numeric(rec_data$decision) !!
+
+# no NAs in dataset
+sum(is.na(rec_data))
+```
+
+### Data Manipulation
+
+Subset data so that it includes gender (the protected attribute), the 8 hiring criteria (ind.university_grade : ind.degree), and the hiring decision.
+
+```{r}
+# keep candidate indicators only
+rec_sub <- rec_data[, -3:-5]
+# remove ID
+rec_sub <- rec_sub[, -1]
+
+# The protected attribute needs to be one-hot encoded
+rec_sub$female   <- rec_sub$gender == "female"
+rec_sub$male     <- rec_sub$gender == "male"
+
+# set all variables to numeric in order to use Rstan
+rec_sub <- rec_sub %>% mutate_all(., as.numeric)
+
+# subtract 1 from all variables so that the values start at 0 instead of 1
+rec_sub <- rec_sub %>% mutate_at(c('ind.debateclub', 'ind.programming_exp',
+                                   'ind.international_exp', 'ind.entrepeneur_exp',
+                                   'ind.exact_study', 'decision'), ~.-1)
+
+# specify which columns belong to the protected attribute
+sensitive_cols <- c("male", "female")
+```
+
+Partition data into test/train
+
+```{r}
+# generate subset IDs
+trainIndex <- createDataPartition(rec_sub$decision, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+
+# split data
+rec_train <- rec_sub[trainIndex,]
+rec_test  <- rec_sub[-trainIndex,]
+
+# create N variable to specify data set length
+n_train <- nrow(rec_train)
+n_test <- nrow(rec_test)
+```
+
+### Fit Training Data
+
+Put data in a list to create the type of input required by the `stan` functions. 
+$N$ is the sample size, $K$ is the number of columns belonging to the protected attribute (2 for `male`, `female`), $a$ is a matrix containing the two columns male and female, the rest are the indicator variables (i.e. the candidate features) and the outcome variable.
+
+```{r}
+rec_stan_train <- list(N = n_train, K = length(sensitive_cols),
+                 a = data.matrix(rec_train[, sensitive_cols]), 
+                 grade = rec_train[, c("ind.university_grade")],
+                 debate = rec_train[, c("ind.debateclub")],
+                 programming = rec_train[, c("ind.programming_exp")],
+                 internat = rec_train[, c("ind.international_exp")],
+                 entrep = rec_train[, c("ind.entrepeneur_exp")],
+                 lang = rec_train[, c("ind.languages")],
+                 study = rec_train[, c("ind.exact_study")],
+                 degree = rec_train[, c("ind.degree")],
+                 decision = rec_train[, c("decision")])
+```
+
+Run the `MCMC` algorithm using `stan`. There are 2 chains of 6000 iterations each, the first 2000 are part of the burn-in period. The initial values of the chains are chosen randomly by the function and a seed is set for reproducibility.
+
+```{r}
+stan_fit <- stan(file = 'rec_train.stan', data = rec_stan_train,
+                 iter = 6000, warmup = 2000, chains = 2,
+                 cores = 2, init = "random", seed = 25,
+                 verbose = TRUE)
+```
+
+Extract samples from the posterior 
+
+    !!! why permuted here but not in monitor?
+
+```{r}
+fit_data <- extract(stan_fit, permuted = TRUE)
+```
+
+Use `monitor()` to obtain R-hat, Bulk-ESS and Tail-ESS. These are diagnostic measures to check the form and effectiveness of the posterior.
+
+```{r}
+check_fit <- monitor(extract(stan_fit, permuted = FALSE, inc_warmup = TRUE))
+```
+
+Overlap of the estimates density for each chain to check whether convergence was not achieved.  It's impractical to make graphs of nearly 4000 parameters estimated by the `MCMC`, so I have chosen 5 parameters.
+
+      !!! why these 5?
+
+```{r}
+dens_sep <- stan_dens(stan_fit, pars = c("sigma_g", "u[965]", "entrep0", 
+                                         "eta_u_grade", "eta_a_programming"),
+                      separate_chains = TRUE, alpha = 0.3)
+dens_sep + scale_fill_manual(values = c("blue", "maroon"))
+```
+
+Traceplots of the 2 chains, the same 5 parameters are selected.
+
+```{r}
+trace <- stan_trace(stan_fit, pars = c("sigma_g", "u[965]", "entrep0",
+                                       "eta_u_grade", "eta_a_programming"))
+trace + scale_color_manual(values = c("blue", "maroon"))
+```
+
+Calculate column averages to obtain individual value estimates for each candidate and individual parameter estimates for the model.
+
+```{r}
+u_factor   <- colMeans(fit_data$u)
+
+rec_train$u <- u_factor
+
+grade0 <- mean(fit_data$grade0)
+eta_u_grade <- mean(fit_data$eta_u_grade)
+eta_a_grade <- colMeans(fit_data$eta_a_grade)
+
+debate0 <- mean(fit_data$debate0)
+eta_u_debate <- mean(fit_data$eta_u_debate)
+eta_a_debate <- colMeans(fit_data$eta_a_debate)
+
+programming0 <- mean(fit_data$programming0)
+eta_u_programming <- mean(fit_data$eta_u_programming)
+eta_a_programming <- colMeans(fit_data$eta_a_programming)
+
+internat0 <- mean(fit_data$internat0)
+eta_u_internat <- mean(fit_data$eta_u_internat)
+eta_a_internat <- colMeans(fit_data$eta_a_internat)
+
+entrep0 <- mean(fit_data$entrep0)
+eta_u_entrep <- mean(fit_data$eta_u_entrep)
+eta_a_entrep <- colMeans(fit_data$eta_a_entrep)
+
+lang0 <- mean(fit_data$lang0)
+eta_u_lang <- mean(fit_data$eta_u_lang)
+eta_a_lang <- colMeans(fit_data$eta_a_lang)
+
+study0 <- mean(fit_data$study0)
+eta_u_study <- mean(fit_data$eta_u_study)
+eta_a_study <- colMeans(fit_data$eta_a_study)
+
+degree0 <- mean(fit_data$degree0)
+eta_u_degree <- mean(fit_data$eta_u_degree)
+eta_a_degree <- colMeans(fit_data$eta_a_degree)
+
+SIGMA_G <- mean(fit_data$sigma_g)
+```
+
+# Only finished for the non-deterministic model
+
+### Fit Testing Data
+
+Create multiple data sets to represent the hypothetical "all candidates are male" and "all candidates are female" scenarios.
+
+```{r}
+test_cff <- rec_test
+
+test_allfemale <- rec_test
+test_allfemale$female <- 1
+test_allfemale$male <- 0
+
+test_allmale <- rec_test
+test_allmale$female <- 0
+test_allmale$male <- 1
+```
+
+Create the "all female" and "all male" data lists to use in `stan`  (using the previously estimated model parameters)
+
+```{r}
+rec_stan_test_allfemale <- list(
+  N = n_test, K = length(sensitive_cols),
+  a = data.matrix(test_allfemale[, sensitive_cols]), 
+  
+  grade = test_allfemale[, c("ind.university_grade")],
+  debate = test_allfemale[, c("ind.debateclub")],
+  programming = test_allfemale[, c("ind.programming_exp")],
+  internat = test_allfemale[, c("ind.international_exp")],
+  entrep = test_allfemale[, c("ind.entrepeneur_exp")],
+  lang = test_allfemale[, c("ind.languages")],
+  study = test_allfemale[, c("ind.exact_study")],
+  degree = test_allfemale[, c("ind.degree")],
+  
+  grade0 = grade0, eta_u_grade = eta_u_grade, eta_a_grade = eta_a_grade,
+  debate0 = debate0, eta_u_debate = eta_u_debate, eta_a_debate = eta_a_debate,
+  programming0 = programming0, eta_u_programming = eta_u_programming, eta_a_programming = eta_a_programming,
+  internat0 = internat0, eta_u_internat = eta_u_internat, eta_a_internat = eta_a_internat,
+  entrep0 = entrep0, eta_u_entrep = eta_u_entrep, eta_a_entrep = eta_a_entrep,
+  lang0 = lang0, eta_u_lang = eta_u_lang, eta_a_lang = eta_a_lang,
+  study0 = study0, eta_u_study = eta_u_study, eta_a_study = eta_a_study,
+  degree0 = degree0, eta_u_degree = eta_u_degree, eta_a_degree = eta_a_degree,
+  
+  sigma_g = SIGMA_G
+)
+
+rec_stan_test_allmale <- list(
+  N = n_test, K = length(sensitive_cols),
+  a = data.matrix(test_allmale[, sensitive_cols]), 
+  
+  grade = test_allmale[, c("ind.university_grade")],
+  debate = test_allmale[, c("ind.debateclub")],
+  programming = test_allmale[, c("ind.programming_exp")],
+  internat = test_allmale[, c("ind.international_exp")],
+  entrep = test_allmale[, c("ind.entrepeneur_exp")],
+  lang = test_allmale[, c("ind.languages")],
+  study = test_allmale[, c("ind.exact_study")],
+  degree = test_allmale[, c("ind.degree")],
+  
+  grade0 = grade0, eta_u_grade = eta_u_grade, eta_a_grade = eta_a_grade,
+  debate0 = debate0, eta_u_debate = eta_u_debate, eta_a_debate = eta_a_debate,
+  programming0 = programming0, eta_u_programming = eta_u_programming, eta_a_programming = eta_a_programming,
+  internat0 = internat0, eta_u_internat = eta_u_internat, eta_a_internat = eta_a_internat,
+  entrep0 = entrep0, eta_u_entrep = eta_u_entrep, eta_a_entrep = eta_a_entrep,
+  lang0 = lang0, eta_u_lang = eta_u_lang, eta_a_lang = eta_a_lang,
+  study0 = study0, eta_u_study = eta_u_study, eta_a_study = eta_a_study,
+  degree0 = degree0, eta_u_degree = eta_u_degree, eta_a_degree = eta_a_degree,
+  
+  sigma_g = SIGMA_G
+)
+```
+
+Fit the test data using these two inputs separately
+
+```{r}
+stan_fit_test_allfemale <- stan(file = 'rec_test.stan', data = rec_stan_test_allfemale,
+                      iter = 6000, warmup = 2000, chains = 2, cores = 2,
+                      init = "random", seed = 25, verbose = TRUE)
+
+stan_fit_test_allmale <- stan(file = 'rec_test.stan', data = rec_stan_test_allmale,
+                                iter = 6000, warmup = 2000, chains = 2, cores = 2,
+                                init = "random", seed = 25, verbose = TRUE)
+```
+
+Extract models' fit
+
+```{r}
+fit_data_test_allfemale <- extract(stan_fit_test_allfemale, permuted = TRUE)
+fit_data_test_allmale <- extract(stan_fit_test_allmale, permuted = TRUE)
+```
+
+Check estimation diagnostics
+
+```{r}
+check_fit_test_allfemale <- monitor(extract(stan_fit_test_allfemale, permuted = FALSE, inc_warmup = TRUE))
+check_fit_test_allmale <- monitor(extract(stan_fit_test_allmale, permuted = FALSE, inc_warmup = TRUE))
+```
+
+Extract estimates of latent factor U
+
+```{r}
+u_test_allfemale   <- colMeans(fit_data_test_allfemale$u)
+u_test_allmale   <- colMeans(fit_data_test_allmale$u)
+
+test_allfemale$u_allf <- u_test_allfemale
+test_allmale$u_allm <- u_test_allmale
+```
+
+### Compare Counterfactual Predictions
+
+      !! deterministic model is missing
+
+```{r}
+# Fair non-deterministic model
+# model_f_test <- glm(decision ~ u, family = "binomial", data = rec_test)
+model_f_test_allfemale <- glm(decision ~ u_allf, family = "binomial", data = test_allfemale)
+model_f_test_allmale <- glm(decision ~ u_allm, family = "binomial", data = test_allmale)
+
+# pred_f_test <- predict.glm(model_f_test, type = "response")
+pred_f_test_allfemale <- predict.glm(model_f_test_allfemale, type = "response")
+pred_f_test_allmale <- predict.glm(model_f_test_allmale, type = "response")
+
+# Create data frame with all the predictions
+cff_preds <- as.data.frame(matrix(NA, nrow = 783, ncol = 0))
+cff_preds$gender <- test_cff$gender
+cff_preds$pred_obs <- pred_f_test
+cff_preds$pred_allf <- pred_f_test_allfemale
+cff_preds$pred_allm <- pred_f_test_allmale
+```
+
+### Plots
+
+Here I only compare pred_allf and pred_allm to check whether CFF is achieved
+
+```{r}
+# Density plot
+ggplot(cff_preds) +
+  geom_density(aes(x = pred_allf, fill = "All Female"), alpha = 0.5) +
+  geom_density(aes(x = pred_allm, fill = "All Male"), alpha = 0.5) +
+  scale_fill_manual(values = c("All Female" = "#FFFF80", "All Male" = "#72D8FF")) +
+  xlim(c(0.275, 0.375)) +
+  labs(fill = "Counterfactuals", x = "Predicted Likelihood") +
+  theme_minimal()
+```
+
+### Debiasing score
+
+The predictions made using the 2 counterfactual models are not normally distributed, so I move the sigmoid function at multiple cutoffs to check whether fairness was achieved at different levels of selectivity. A low cutoff would reject most candidates and a high cutoff would accept most candidates - the number of people that are accepted/rejected is not relevant per se, most interesting is the proportion of men and women that are accepted at different cutoffs.
+
+```{r}
+# Create vectors of possible cutoff values
+cutoff_det <- seq(from = .01, to = .99, by = .01)
+cutoff_nondet <- seq(from = .00, to = .60, by = .001)
+
+# Create two empty data frames to store predictions
+out_nondet <- data.frame(matrix(NA, nrow = 783, ncol = 3))
+colnames(out_nondet) <- c("gender", "prob", "prediction")
+out_det <- out_nondet
+
+## FIX GENDER HERE TOO (???)
+out_nondet$gender <- as.factor(rec_test$gender)
+levels(out_nondet$gender) <- c("female", "male")
+out_nondet$prob <- pred_f_test
+
+out_det$gender <- out_nondet$gender
+out_det$prob <- pred_resid_test
+
+decision_det_list <- vector(mode = "list", length = 99)
+decision_nond_list <- vector(mode = "list", length = 601)
+```
+
+```{r}
+for(i in 1:99) {
+  decision_det_list[[i]] <- out_det
+  for (k in 1:783) {
+    decision_det_list[[i]]$prediction[k] <- ifelse(
+      decision_det_list[[i]]$prob[k] >= cutoff_det[i], 1, 0
+    )
+  }
+}
+
+for(i in 1:601) {
+  decision_nond_list[[i]] <- out_nondet
+  for (k in 1:783) {
+    decision_nond_list[[i]]$prediction[k] <- ifelse(
+      decision_nond_list[[i]]$prob[k] >= cutoff_nondet[i], 1, 0
+    )
+  }
+}
+```
+
+```{r}
+overview_det <- vector(mode = "list", length = 99)
+
+for (i in 1:length(decision_det_list)) {
+  result <- decision_det_list[[i]] %>%
+    group_by(gender) %>%
+    summarise(
+      hired_count = sum(prediction == 1),
+      hired_percentage = sum(prediction == 1) / n() * 100
+    )
+  result <- as.data.frame(result)
+  total_row <- data.frame(gender = "total", hired_count = sum(result$hired_count),
+                          hired_percentage = sum(result$hired_count) / 3917 * 100)
+  result <- rbind(result, total_row)
+  overview_det[[i]] <- result
+}
+```
+
+```{r}
+overview_nondet <- vector(mode = "list", length = 169)
+
+for (i in 1:length(decision_nond_list)) {
+  result <- decision_nond_list[[i]] %>%
+    group_by(gender) %>%
+    summarise(
+      hired_count = sum(prediction == 1),
+      hired_percentage = sum(prediction == 1) / n() * 100
+    )
+  result <- as.data.frame(result)
+  total_row <- data.frame(gender = "total", hired_count = sum(result$hired_count),
+                          hired_percentage = sum(result$hired_count) / 783 * 100)
+  result <- rbind(result, total_row)
+  overview_nondet[[i]] <- result
+}
+```
+
+Combine all data frames into a single data frame
+
+```{r}
+combined_df <- bind_rows(overview_det)
+combined_df$cutoff <- rep(cutoff_det, each = 3)
+```
+
+##### Deterministic Model
+
+```{r}
+data_wide <- combined_df[, -2] %>%
+  pivot_wider(names_from = gender, values_from = hired_percentage)
+
+ggplot(data_wide, aes(x = cutoff)) +
+  geom_bar(aes(y = male, fill = "Male"), stat = "identity", alpha = 0.7) +
+  geom_bar(aes(y = female, fill = "Female"), stat = "identity", alpha = 0.7) +
+  scale_fill_manual(values = c("Male" = "lightblue", "Female" = "yellow")) +
+  labs(x = "Cutoff", y = "Percentage Hired") +
+  theme_minimal()
+
+data_wide_abs <- combined_df[, -3] %>%
+  pivot_wider(names_from = gender, values_from = hired_count)
+
+ggplot(data_wide_abs, aes(x = cutoff)) +
+  scale_fill_manual(values = c("Male" = "lightblue", "Female" = "yellow")) +
+  geom_bar(aes(y = male, fill = "Male"), stat = "identity", alpha = 0.7) +
+  geom_bar(aes(y = female, fill = "Female"), stat = "identity", alpha = 0.7) +
+  labs(x = "Cutoff", y = "Count Hired") +
+  theme_minimal()
+```
+
+###### Non-Deterministic Model
+
+```{r}
+combined_nondet <- bind_rows(overview_nondet)
+combined_nondet$cutoff <- rep(cutoff_nondet, each = 3)
+
+data_wide_nondet <- combined_nondet[, -2] %>%
+  pivot_wider(names_from = gender, values_from = hired_percentage)
+
+ggplot(data_wide_nondet, aes(x = cutoff)) +
+  scale_x_continuous(limits=c(0.15, 0.55)) +
+  geom_bar(aes(y = male, fill = "Male"), stat = "identity", alpha = 0.7) +
+  geom_bar(aes(y = female, fill = "Female"), stat = "identity", alpha = 0.7) +
+  scale_fill_manual(values = c("Male" = "lightblue", "Female" = "yellow")) +
+  labs(x = "Cutoff", y = "Percentage Hired") +
+  theme_minimal()
+
+data_wide_nondet_abs <- combined_nondet[, -3] %>%
+  pivot_wider(names_from = gender, values_from = hired_count)
+
+ggplot(data_wide_nondet_abs, aes(x = cutoff)) +
+  scale_x_continuous(limits=c(0.15, 0.55)) +
+  scale_fill_manual(values = c("Male" = "lightblue", "Female" = "yellow")) +
+  geom_bar(aes(y = male, fill = "Male"), stat = "identity", alpha = 0.7) +
+  geom_bar(aes(y = female, fill = "Female"), stat = "identity", alpha = 0.7) +
+  labs(x = "Cutoff", y = "Count Hired") +
+  theme_minimal()
+```
+
+###### Total Model
+
+```{r}
+out_total <- data.frame(matrix(NA, nrow = 783, ncol = 3))
+colnames(out_total) <- c("gender", "prob", "prediction")
+
+out_total$gender <- out_nondet$gender
+out_total$prob <- pred_all_test
+
+decision_total_list <- vector(mode = "list", length = 99)
+
+for(i in 1:99) {
+  decision_total_list[[i]] <- out_total
+  for (k in 1:783) {
+    decision_total_list[[i]]$prediction[k] <- ifelse(
+      decision_total_list[[i]]$prob[k] >= cutoff_det[i], 1, 0
+    )
+  }
+}
+
+overview_total <- vector(mode = "list", length = 99)
+
+for (i in 1:length(decision_total_list)) {
+  result <- decision_total_list[[i]] %>%
+    group_by(gender) %>%
+    summarise(
+      hired_count = sum(prediction == 1),
+      hired_percentage = sum(prediction == 1) / n() * 100
+    )
+  result <- as.data.frame(result)
+  total_row <- data.frame(gender = "total", hired_count = sum(result$hired_count),
+                          hired_percentage = sum(result$hired_count) / 783 * 100)
+  result <- rbind(result, total_row)
+  overview_total[[i]] <- result
+}
+
+combined_total <- bind_rows(overview_total)
+combined_total$cutoff <- rep(cutoff_det, each = 3)
+
+data_wide_total_abs <- combined_total[, -3] %>%
+  pivot_wider(names_from = gender, values_from = hired_count)
+
+ggplot(data_wide_total_abs, aes(x = cutoff)) +
+  scale_fill_manual(values = c("Male" = "lightblue", "Female" = "yellow")) +
+  geom_bar(aes(y = male, fill = "Male"), stat = "identity", alpha = 0.7) +
+  geom_bar(aes(y = female, fill = "Female"), stat = "identity", alpha = 0.7) +
+  labs(x = "Cutoff", y = "Count Hired") +
+  theme_minimal()
+```
+
+##### Unaware Model
+
+```{r}
+out_unaware <- data.frame(matrix(NA, nrow = 783, ncol = 3))
+colnames(out_unaware) <- c("gender", "prob", "prediction")
+
+out_unaware$gender <- out_nondet$gender
+out_unaware$prob <- pred_un_test
+
+decision_unaware_list <- vector(mode = "list", length = 99)
+
+for(i in 1:99) {
+  decision_unaware_list[[i]] <- out_unaware
+  for (k in 1:783) {
+    decision_unaware_list[[i]]$prediction[k] <- ifelse(
+      decision_unaware_list[[i]]$prob[k] >= cutoff_det[i], 1, 0
+    )
+  }
+}
+
+overview_unaware <- vector(mode = "list", length = 99)
+
+for (i in 1:length(decision_unaware_list)) {
+  result <- decision_unaware_list[[i]] %>%
+    group_by(gender) %>%
+    summarise(
+      hired_count = sum(prediction == 1),
+      hired_percentage = sum(prediction == 1) / n() * 100
+    )
+  result <- as.data.frame(result)
+  total_row <- data.frame(gender = "total", hired_count = sum(result$hired_count),
+                          hired_percentage = sum(result$hired_count) / 783 * 100)
+  result <- rbind(result, total_row)
+  overview_unaware[[i]] <- result
+}
+
+combined_unaware <- bind_rows(overview_unaware)
+combined_unaware$cutoff <- rep(cutoff_det, each = 3)
+
+data_wide_unaware_abs <- combined_unaware[, -3] %>%
+  pivot_wider(names_from = gender, values_from = hired_count)
+
+ggplot(data_wide_unaware_abs, aes(x = cutoff)) +
+  scale_fill_manual(values = c("Male" = "lightblue", "Female" = "yellow")) +
+  geom_bar(aes(y = male, fill = "Male"), stat = "identity", alpha = 0.7) +
+  geom_bar(aes(y = female, fill = "Female"), stat = "identity", alpha = 0.7) +
+  labs(x = "Cutoff", y = "Count Hired") +
+  theme_minimal()
+```
+
+### Can't remember what this is - fairness measure
+
+```{r}
+n_f <- 350
+n_m <- 433
+
+data_wide_abs$ratio <- NA
+data_wide_total_abs$ratio <- NA
+data_wide_unaware_abs$ratio <- NA
+
+for (i in 1:99) {
+  data_wide_abs$ratio[i] <- (data_wide_abs$female[i] * n_m) / (data_wide_abs$male[i] * n_f)
+  data_wide_total_abs$ratio[i] <- (data_wide_total_abs$female[i] * n_m) / (data_wide_total_abs$male[i] * n_f)
+  data_wide_unaware_abs$ratio[i] <- (data_wide_unaware_abs$female[i] * n_m) / (data_wide_unaware_abs$male[i] * n_f)
+}
+
+data_wide_nondet_abs$ratio <- NA
+
+for (i in 1:601) {
+  data_wide_nondet_abs$ratio[i] <- (data_wide_nondet_abs$female[i] * n_m) / (data_wide_nondet_abs$male[i] * n_f)
+}
+
+hist(data_wide_total_abs$ratio)
+hist(data_wide_unaware_abs$ratio)
+hist(data_wide_nondet_abs$ratio)
+hist(data_wide_abs$ratio)
+
+mean(data_wide_total_abs$ratio, na.rm = T) # 0.5487739
+mean(data_wide_unaware_abs$ratio, na.rm = T) # 0.5471605
+mean(data_wide_nondet_abs$ratio, na.rm = T) # 0.8728864
+mean(data_wide_abs$ratio, na.rm = T) # 0.8814077
+```
+
+### Compare Counterfactuals
+
+```{r}
+cutoff_cf <- seq(from = .25, to = .40, by = .001)
+
+# dataframe with CF predictions = cff_preds
+# from actual_cff_test.R
+
+decision_cf_list <- vector(mode = "list", length = 151)
+
+for(i in 1:151) {
+  decision_cf_list[[i]] <- cff_preds
+  for (k in 1:783) {
+    decision_cf_list[[i]]$bin_allf[k] <- ifelse(
+      decision_cf_list[[i]]$pred_allf[k] >= cutoff_cf[i], 1, 0
+    )
+    decision_cf_list[[i]]$bin_allm[k] <- ifelse(
+      decision_cf_list[[i]]$pred_allm[k] >= cutoff_cf[i], 1, 0
+    )
+  }
+}
+
+overview_cf <- as.data.frame(matrix(NA, nrow = 151, ncol = 0))
+overview_cf$cutoff <- cutoff_cf
+
+counts <- rep(NA, 151)
+
+for (i in seq_along(decision_cf_list)) {
+  # count how often the counterfactuals have the same prediction
+  counts[i] <- sum(decision_cf_list[[i]]$bin_allf == decision_cf_list[[i]]$bin_allm)
+}
+
+overview_cf$counts <- counts
+
+
+
+risk_ratios <- numeric(length(cutoff_cf))
+
+for (i in seq_along(decision_cf_list)) {
+  # relative risk formula = (allfemale CF hired / tot allfemale CF) / (allmale CF fired / tot allmale CF)
+  risk_ratios[i] <- ifelse(sum(decision_cf_list[[i]]$bin_allf) == sum(decision_cf_list[[i]]$bin_allm), 1,
+    (sum(decision_cf_list[[i]]$bin_allf) / 783) / (sum(decision_cf_list[[i]]$bin_allm) / 783))
+}
+
+
+```
+
